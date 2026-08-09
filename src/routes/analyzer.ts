@@ -1,7 +1,8 @@
 import {Request,Response } from 'express'
+import { extractJson } from '../lib/json'
 import { GoogleGenerativeAI } from "@google/generative-ai";
 const genAI = new GoogleGenerativeAI(process.env.AI_KEY as string);
-const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+const model = genAI.getGenerativeModel({ model: process.env.GEMINI_MODEL || "gemini-3.5-flash" });
 import {tavily} from '@tavily/core'
 const client =tavily({apiKey: process.env.TAVILY_KEY})
 import Redis from "ioredis"
@@ -65,10 +66,10 @@ async function caller(query:any){
      while(end){
         const out=await chat.sendMessage([query])
         console.log(out.response.text())
-        const result= (out.response.text().slice(7,out.response.text().length-3))
+        const result = out.response.text()
        
         // console.log(JSON.parse(result))
-        var data=JSON.parse(result)
+        var data = extractJson(result)
       
         if(data){
           console.log('hi from data')
@@ -107,8 +108,12 @@ export async function analyzer(req:Request,res:Response){
            redis.set(`${userId}`,JSON.stringify(data.data),'EX',86400);
           res.json({data:out})
      } catch (error:any) {
-        console.error(JSON.stringify(error))
-
+        // Always send a response. Previously this only logged, so the request
+        // hung forever and the frontend spinner never stopped.
+        console.error('[analyzer] failed:', error?.message || error)
+        if (!res.headersSent) {
+          res.status(500).json({ error: error?.message || 'Analysis failed' })
+        }
      }
      
 }

@@ -1,8 +1,9 @@
 import {Request,Response} from 'express'
+import { extractJson } from '../lib/json'
 import Redis from "ioredis"
 import { GoogleGenerativeAI } from "@google/generative-ai";
 const genAI = new GoogleGenerativeAI(process.env.AI_KEY as string);
-const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+const model = genAI.getGenerativeModel({ model: process.env.GEMINI_MODEL || "gemini-3.5-flash" });
 import {tavily} from '@tavily/core'
 const client =tavily({apiKey: process.env.TAVILY_KEY})
 const redis = new Redis(process.env.REDIS_KEY as string);
@@ -72,10 +73,10 @@ async function caller(query:any){
         while(end){
             const out=await chat.sendMessage([query])
             // console.log(out.response.text())
-            const result= (out.response.text().slice(7,out.response.text().length-3))
+            const result = out.response.text()
         console.log( result)
         // console.log(JSON.parse(result))
-        var data=JSON.parse(result)
+        var data = extractJson(result)
         console.log(data)
             if(data){
               if(data.type=='final'){
