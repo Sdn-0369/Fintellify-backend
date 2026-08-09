@@ -4,108 +4,99 @@ import Redis from "ioredis"
 import { GoogleGenerativeAI } from "@google/generative-ai";
 const genAI = new GoogleGenerativeAI(process.env.AI_KEY as string);
 const model = genAI.getGenerativeModel({ model: process.env.GEMINI_MODEL || "gemini-3.5-flash" });
-import {tavily} from '@tavily/core'
-const client =tavily({apiKey: process.env.TAVILY_KEY})
 const redis = new Redis(process.env.REDIS_KEY as string)
+
+// The shape below is exactly what the frontend's <Plot> expects:
+// each visual becomes a trace with { x, y, type } plus a title.
 const systemInstruction={
     role:'user',
     parts:[{
         text:`
-        {
-  "role": "system",
-  "instructions": {
-  "purpose": "You are a legal visualization tool that analyzes complex legal documents and outputs helpful visualizations (charts, timelines, flow diagrams, and tables) to assist users in understanding legal terms, obligations, and risks quickly and clearly.",
-  "audience": "Everyday citizens and small business owners needing clear, visual explanations of legal documents.",
-  "behavior": [
-    "Always generate relevant visual aids (charts, timelines, flow diagrams, or tables) to clarify key clauses, obligations, deadlines, and risks.",
-    "Only return the core output in the defined JSON format.",
-    "Avoid any explanatory or introductory text outside the structured output."
-  ],
-  "output_format": {
-    "description": "Use this format for your response after analyzing the legal document or clause set.",
-    "structure": {
-      "type": "final",
-      "visuals": [
-        {
-          "visual_type": "timeline|flow|bar|table|scatter",
-          "data": {
-            "x": "[Array of x-axis points (dates, clause labels, or strings)]",
-            "y": "[Array of y-axis points (numbers or severity scores) — optional for non-numeric visuals]",
-            "rows": "[Array of rows for table visuals — each row is an object]",
-            "connections": "[Array of edges for flow diagrams — each edge is an object with from/to labels]"
-          },
-          "title": "Title of the visual",
-          "caption": "One-line caption describing what the visual highlights (no extra commentary)."
-        }
-      ]
-    },
-    "notes": [
-      "The entire output JSON must be enclosed within double quotes to ensure parsability.",
-      "You may return multiple visuals inside the 'visuals' array — each must follow the same structure.",
-      "Do not include commentary or narrative outside the structured JSON — output only the structured JSON."
-    ]
-  },
-  "input_format": {
-    "description": "Input structure received for processing legal documents.",
-    "structure": {
-      "userId": "reference_user_id",
-      "reference": "Raw legal document text or extracted clauses to be visualized"
+You are a legal visualization tool. You read a legal document and produce a small
+set of charts that help a layperson understand its key obligations, deadlines,
+costs and risks.
+
+Return ONLY raw JSON. No markdown, no code fences, no commentary.
+
+Exact output format:
+{
+  "type": "final",
+  "visuals": [
+    {
+      "chart_type": "bar",
+      "title": "Short chart title",
+      "caption": "One line describing what this shows",
+      "x": ["Label A", "Label B", "Label C"],
+      "y": [10, 25, 40]
     }
-  },
-  "rules": [
-    "Focus only on visualization generation to clarify legal content.",
-    "Choose the visual type that best represents the concept (e.g., timeline for deadlines, flow for obligations, table for clause-by-clause breakdown).",
-    "Ensure all visual fields are accurately populated with relevant values and labels.",
-    "Maximum 3 to 4 visuals per response. No more."
   ]
 }
 
-}
-
+Rules:
+- "chart_type" MUST be one of exactly: "bar", "scatter", "line".
+- "x" is an array of strings (labels, clause names, or dates).
+- "y" is an array of NUMBERS only (amounts, days, or a 1-10 severity score).
+- "x" and "y" MUST be the same length, and each needs at least 2 entries.
+- Return 3 to 4 visuals maximum.
+- Never include null, undefined, or non-numeric values in "y".
         `
     }]
 }
-async function caller(query:any){
-    let end=true;
-    var history:any=[]
-    const chat =model.startChat({
-        systemInstruction,
-        history
-    })
 
-        var answer=await chat.sendMessage([query])
-        console.log(answer.response.text())
-       
-            const out=await chat.sendMessage([query])
-            console.log(out.response.text())
-            const result = out.response.text()
-            // console.log( result)
-            // console.log(JSON.parse(result))
-            var data = extractJson(result)
-            console.log(data)
-            if(data){
-                if(data.type=='final'){
-                    return data.charts
-                }
-            }
-            
-          
-    
+// Normalises whatever the model returns into the flat trace shape the frontend
+// renders. Guards against the model nesting values under "data" or using
+// "visual_type", and drops anything that would make Plotly throw.
+function normaliseVisuals(raw:any):any[]{
+    const list = raw?.visuals || raw?.charts || []
+    if (!Array.isArray(list)) return []
+
+    const allowed:Record<string,string> = { bar:'bar', scatter:'scatter', line:'scatter' }
+
+    return list.map((v:any) => {
+        const src = v?.data && (v.data.x || v.data.y) ? v.data : v
+        const rawType = String(v?.chart_type || v?.visual_type || 'bar').toLowerCase()
+        return {
+            chart_type: allowed[rawType] || 'bar',
+            title: v?.title || '',
+            caption: v?.caption || '',
+            x: Array.isArray(src?.x) ? src.x : [],
+            y: Array.isArray(src?.y) ? src.y.map(Number) : [],
+        }
+    }).filter((v:any) =>
+        v.x.length > 1 &&
+        v.y.length > 1 &&
+        v.x.length === v.y.length &&
+        v.y.every((n:any) => typeof n === 'number' && Number.isFinite(n))
+    )
 }
+
+async function caller(query:any){
+    const chat = model.startChat({ systemInstruction, history: [] })
+    const out = await chat.sendMessage([query])
+    const data = extractJson(out.response.text())
+    return normaliseVisuals(data)
+}
+
 export async function charts(req:Request,res:Response){
     //fetching the data from redis
     const userId=res.locals.userId
-    console.log(userId)
-    const data= await redis.get(`${userId}`)
-    if(data){
+    try {
+        const data= await redis.get(`${userId}`)
+        if(!data){
+            res.status(202).json({data:'ISSUE WITH YOUR FILE REUPLOAD'})
+            return
+        }
         const obj=JSON.stringify({userId,reference:data})
         const out=await caller(obj)
-        console.log(out)
+        if(!out.length){
+            res.status(200).json({data:[], error:'No chartable data could be extracted from this document.'})
+            return
+        }
         res.status(200).json({data:out})
+    } catch (error:any) {
+        console.error('[charts] failed:', error?.message || error)
+        if (!res.headersSent) {
+            res.status(500).json({ error: error?.message || 'Chart generation failed' })
+        }
     }
-    else{
-        res.status(202).json({data:'ISSUE WITH YOUR FILE REUPLOAD'})
-
-    }
-   
 }
